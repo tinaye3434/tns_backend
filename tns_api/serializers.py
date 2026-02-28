@@ -1,10 +1,10 @@
 from rest_framework import serializers
-from .models import Allowance, ApprovalStage, Employee, Claim
+from .models import Allowance, ApprovalStage, Employee, Claim, ClaimLine
 
 class AllowanceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Allowance
-        fields = ('id', 'title', 'classification', 'price', 'status')
+        fields = ('id', 'title', 'cost', 'status')
         
 class ApprovalStageSerializer(serializers.ModelSerializer):
     class Meta:
@@ -32,5 +32,16 @@ class ClaimsSerializer(serializers.ModelSerializer):
             'total',
             'stage_id',
             'status',
+        )
+
+class ClaimLineSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ClaimLine
+        fields = (
+            'id',
+            'claim_id',
+            'allowance_id',
+            'quantity',
+            'amount',
         )
 

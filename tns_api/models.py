@@ -64,12 +64,7 @@ class Employee(models.Model):
     
 class Allowance(models.Model):
     title = models.CharField(max_length=50)
-    classification = models.CharField(
-        max_length=10,
-        choices=TnsClassifications.choices,
-        default=TnsClassifications.QUANTITY
-    )
-    price = models.FloatField()
+    cost = models.FloatField()
     status = models.CharField(
         max_length=1,
         choices=Status.choices,
@@ -110,4 +105,13 @@ class Claim(models.Model):
 
     def _str_(self):
         return str(self.employee_id)
+
+class ClaimLine(models.Model):
+    claim_id = models.IntegerField()
+    allowance_id = models.IntegerField()
+    quantity = models.FloatField()
+    amount = models.FloatField()
+
+    def _str_(self):
+        return str(self.claim_id)
 

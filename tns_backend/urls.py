@@ -17,8 +17,6 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework import routers
-from django.contrib import admin
-from django.urls import path
 from tns_api import views
 
 router = routers.DefaultRouter()
@@ -26,9 +24,10 @@ router.register(r'allowances', views.AllowanceView, 'allowance')
 router.register(r'approval-stages', views.ApprovalStageView, 'approval-stage')
 router.register(r'employee', views.EmployeeView, 'employee')
 router.register(r'claims', views.ClaimView, 'claims')
+router.register(r'claim-lines', views.ClaimLineView, 'claim-line')
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include(router.urls))
+    path('api/', include(router.urls)),
+    path('api/enums/', views.enums_view, name='enums'),
 ]
-
