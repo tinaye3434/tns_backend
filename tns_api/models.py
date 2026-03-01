@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Max
 
 class Department(models.TextChoices):
     FINANCE = "FINANCE", "Finance"
@@ -76,12 +77,13 @@ class Allowance(models.Model):
     
 class ApprovalStage(models.Model):
     title = models.CharField(max_length=20)
-    order = models.CharField(max_length=2)
-    status = models.CharField(
-        max_length=1,
-        choices=Status.choices,
-        default=Status.ACTIVE
-    )
+    order = models.PositiveIntegerField(default=1, db_index=True)
+
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            max_order = ApprovalStage.objects.aggregate(max_order=Max("order"))["max_order"] or 0
+            self.order = max_order + 1
+        super().save(*args, **kwargs)
     
     def _str_(self):
         return self.title
@@ -89,12 +91,14 @@ class ApprovalStage(models.Model):
 class Claim(models.Model):
     employee_id = models.IntegerField()
     purpose = models.TextField()
-    departure_date = models.DateField()
-    arrival_date = models.DateField()
+    departure_date = models.DateTimeField()
+    return_date = models.DateTimeField()
     nights = models.IntegerField()
     days = models.IntegerField()
+    origin = models.TextField()
     destination = models.TextField()
-    distance_full = models.FloatField()
+    user_distance = models.FloatField()
+    calculated_distance = models.FloatField()
     total = models.FloatField()
     stage_id = models.IntegerField()
     status = models.CharField(
@@ -114,4 +118,3 @@ class ClaimLine(models.Model):
 
     def _str_(self):
         return str(self.claim_id)
-
