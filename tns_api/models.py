@@ -29,6 +29,17 @@ class Status(models.IntegerChoices):
     ACTIVE = 1, "Active"
     INACTIVE = 0, "Inactive"
 
+class Location(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    longitude = models.FloatField()
+    latitude = models.FloatField()
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
 class Employee(models.Model):
     first_name = models.TextField()
     surname = models.TextField()

@@ -25,6 +25,8 @@ router.register(r'approval-stages', views.ApprovalStageView, 'approval-stage')
 router.register(r'employee', views.EmployeeView, 'employee')
 router.register(r'claims', views.ClaimView, 'claims')
 router.register(r'claim-lines', views.ClaimLineView, 'claim-line')
+router.register(r'locations', views.LocationView, 'location')
+router.register(r'cities', views.LocationView, 'city')
 
 urlpatterns = [
     path('admin/', admin.site.urls),
