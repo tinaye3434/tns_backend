@@ -1,11 +1,32 @@
 from django.db import transaction
+import os
+from django.contrib.auth import authenticate
+from django.contrib.auth.models import User
+from django.utils.crypto import get_random_string
+from django.core.mail import send_mail
+from urllib import request as urlrequest
+from urllib.parse import urlencode
+import json
 import math
 from datetime import timedelta
 from rest_framework import status as drf_status, viewsets
-from rest_framework.decorators import action, api_view
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework import serializers
-from .serializers import AllowanceSerializer, ApprovalStageSerializer, EmployeeSerializer, ClaimsSerializer, ClaimLineSerializer, LocationSerializer
+from rest_framework.permissions import AllowAny, IsAuthenticated, BasePermission
+from rest_framework.authtoken.models import Token
+from .serializers import (
+    AllowanceSerializer,
+    ApprovalStageSerializer,
+    EmployeeSerializer,
+    ClaimsSerializer,
+    ClaimLineSerializer,
+    LocationSerializer,
+    UserSerializer,
+    ReceiptSerializer,
+    GPSValidationSerializer,
+    ThresholdConfigSerializer,
+)
 from .models import (
     Allowance,
     ApprovalStage,
@@ -19,7 +40,15 @@ from .models import (
     Gender,
     TnsClassifications,
     Status,
+    UserRole,
+    UserProfile,
+    AuditLog,
+    Receipt,
+    GPSValidation,
+    OCRResult,
+    ThresholdConfig,
 )
+from .ocr import run_ocr
 
 # Create your views here.
 
@@ -81,10 +110,139 @@ class ApprovalStageView(viewsets.ModelViewSet):
 
         return Response({"detail": "Approval stages reordered"})
 
+    @action(detail=True, methods=['put'], url_path='employees')
+    def employees(self, request, pk=None):
+        stage = self.get_object()
+        ids = request.data.get('ids')
+
+        if not isinstance(ids, list):
+            return Response(
+                {"detail": "ids must be a list of employee IDs"},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            employee_ids = [int(emp_id) for emp_id in ids]
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "ids must contain only integers"},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        employees = list(Employee.objects.filter(id__in=employee_ids))
+        if len(employees) != len(set(employee_ids)):
+            return Response(
+                {"detail": "One or more employee IDs are invalid"},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            current_ids = set(stage.employees.values_list('id', flat=True))
+            new_ids = set(employee_ids)
+            added_ids = new_ids - current_ids
+            removed_ids = current_ids - new_ids
+
+            stage.employees.set(employees)
+
+            if added_ids:
+                for employee in Employee.objects.filter(id__in=added_ids):
+                    if not employee.user:
+                        continue
+                    profile, _ = UserProfile.objects.get_or_create(user=employee.user)
+                    if profile.role != UserRole.ADMIN:
+                        profile.role = UserRole.APPROVER
+                        profile.save(update_fields=["role"])
+
+            if removed_ids:
+                for employee in Employee.objects.filter(id__in=removed_ids):
+                    if not employee.user:
+                        continue
+                    profile, _ = UserProfile.objects.get_or_create(user=employee.user)
+                    if profile.role == UserRole.ADMIN:
+                        continue
+                    remaining = employee.approval_stages.exclude(id=stage.id).exists()
+                    if not remaining:
+                        profile.role = UserRole.EMPLOYEE
+                        profile.save(update_fields=["role"])
+
+        serializer = self.get_serializer(stage)
+        return Response(serializer.data)
+
 
 class EmployeeView(viewsets.ModelViewSet):
     serializer_class = EmployeeSerializer
     queryset = Employee.objects.all()
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            employee = serializer.save()
+
+            temp_password = None
+            if employee.user_id is None:
+                username = (employee.email or "").strip()
+                if not username:
+                    raise serializers.ValidationError({"email": "Email is required to create a user."})
+
+                user = User.objects.filter(username=username).first()
+                if not user and employee.email:
+                    user = User.objects.filter(email=employee.email).first()
+
+                if user and getattr(user, "employee_profile", None):
+                    raise serializers.ValidationError(
+                        {"email": "A user with this email is already linked to an employee."}
+                    )
+
+                if not user:
+                    user = User.objects.create(
+                        username=username,
+                        email=employee.email,
+                        first_name=employee.first_name,
+                        last_name=employee.surname,
+                        is_active=True,
+                    )
+                    temp_password = get_random_string(12)
+                    user.set_password(temp_password)
+                    user.save(update_fields=["password"])
+
+                updated_fields = []
+                if not user.email and employee.email:
+                    user.email = employee.email
+                    updated_fields.append("email")
+                if not user.first_name and employee.first_name:
+                    user.first_name = employee.first_name
+                    updated_fields.append("first_name")
+                if not user.last_name and employee.surname:
+                    user.last_name = employee.surname
+                    updated_fields.append("last_name")
+                if updated_fields:
+                    user.save(update_fields=updated_fields)
+
+                employee.user = user
+                employee.save(update_fields=["user"])
+
+                profile, _ = UserProfile.objects.get_or_create(user=user)
+                profile.role = UserRole.EMPLOYEE
+                profile.save(update_fields=["role"])
+
+        output = self.get_serializer(employee).data
+        if temp_password:
+            output["temporary_password"] = temp_password
+            try:
+                if employee.email:
+                    send_mail(
+                        "Your Travel Claims Account",
+                        f"Hello {employee.first_name},\n\nYour account has been created.\nUsername: {user.username}\nTemporary password: {temp_password}\n\nPlease log in and change your password.",
+                        None,
+                        [employee.email],
+                        fail_silently=True,
+                    )
+            except Exception:
+                pass
+        headers = self.get_success_headers(output)
+        return Response(output, status=drf_status.HTTP_201_CREATED, headers=headers)
 
 
 class ClaimView(viewsets.ModelViewSet):
@@ -97,19 +255,102 @@ class ClaimView(viewsets.ModelViewSet):
         origin = Location.objects.filter(name__iexact=origin_name).first()
         destination = Location.objects.filter(name__iexact=destination_name).first()
         if not origin or not destination:
-            return None
+            origin_coords = self._geocode_location(origin_name)
+            destination_coords = self._geocode_location(destination_name)
+            if not origin_coords or not destination_coords:
+                return None
+            return self._haversine_km(origin_coords, destination_coords)
 
         # Haversine formula
+        return self._haversine_km(
+            (origin.latitude, origin.longitude),
+            (destination.latitude, destination.longitude),
+        )
+
+    def _haversine_km(self, origin_coords, destination_coords):
         radius_km = 6371.0
-        lat1 = math.radians(origin.latitude)
-        lon1 = math.radians(origin.longitude)
-        lat2 = math.radians(destination.latitude)
-        lon2 = math.radians(destination.longitude)
+        lat1, lon1 = origin_coords
+        lat2, lon2 = destination_coords
+        lat1 = math.radians(lat1)
+        lon1 = math.radians(lon1)
+        lat2 = math.radians(lat2)
+        lon2 = math.radians(lon2)
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
         return radius_km * c
+
+    def _geocode_location(self, query):
+        params = {
+            "q": query,
+            "format": "json",
+            "addressdetails": 1,
+            "limit": 1,
+            "countrycodes": "zw",
+        }
+        email = os.getenv("NOMINATIM_EMAIL", "")
+        if email:
+            params["email"] = email
+
+        url = f"https://nominatim.openstreetmap.org/search?{urlencode(params)}"
+        req = urlrequest.Request(
+            url,
+            headers={
+                "User-Agent": "tns-backend/1.0 (contact: support@example.com)",
+            },
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if not payload:
+                return None
+            item = payload[0]
+            return float(item["lat"]), float(item["lon"])
+        except Exception:
+            return None
+
+    def _get_threshold_pct(self):
+        record = ThresholdConfig.objects.filter(key="GPS_VARIANCE_THRESHOLD").first()
+        if record:
+            return float(record.value)
+        return float(os.getenv("GPS_VARIANCE_THRESHOLD", "0.15"))
+
+    def _update_gps_validation(self, claim, claimed_distance):
+        if claimed_distance is None:
+            return
+
+        threshold_pct = self._get_threshold_pct()
+        validation = GPSValidation.objects.filter(claim=claim).first()
+        system_distance = None
+
+        if validation:
+            system_distance = validation.adjusted_distance_km
+        if system_distance is None:
+            system_distance = claim.user_distance
+
+        if not system_distance:
+            return
+
+        variance_km = claimed_distance - system_distance
+        variance_pct = abs(variance_km) / max(system_distance, 1)
+        status = "valid" if variance_pct <= threshold_pct else "flagged"
+
+        if validation:
+            validation.claimed_distance_km = claimed_distance
+            validation.variance_km = variance_km
+            validation.variance_pct = variance_pct
+            validation.threshold_pct = threshold_pct
+            validation.status = status
+            validation.save(
+                update_fields=[
+                    "claimed_distance_km",
+                    "variance_km",
+                    "variance_pct",
+                    "threshold_pct",
+                    "status",
+                ]
+            )
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -146,28 +387,35 @@ class ClaimView(viewsets.ModelViewSet):
         if serializer.validated_data.get('stage_id') is None:
             serializer.validated_data['stage_id'] = 1
 
-        calculated_distance = serializer.validated_data.get('calculated_distance')
-        user_distance = serializer.validated_data.get('user_distance')
-        if calculated_distance is None:
-            if auto_distance:
-                calculated_distance = self._distance_km(
-                    serializer.validated_data.get('origin'),
-                    serializer.validated_data.get('destination'),
-                )
-            if calculated_distance is None and user_distance is not None:
-                calculated_distance = user_distance
+        calculated_distance = self._distance_km(
+            serializer.validated_data.get('origin'),
+            serializer.validated_data.get('destination'),
+        )
 
         if calculated_distance is None:
             raise serializers.ValidationError(
-                {"calculated_distance": "Provide calculated_distance, or set auto_distance and valid origin/destination."}
+                {"calculated_distance": "Unable to calculate distance for the given locations."}
             )
 
+        errands_factor = 1.2
+        adjusted_distance = calculated_distance * errands_factor
+
         serializer.validated_data['calculated_distance'] = calculated_distance
-        if user_distance is None:
-            serializer.validated_data['user_distance'] = calculated_distance
+        serializer.validated_data['user_distance'] = adjusted_distance
 
         with transaction.atomic():
             claim = Claim.objects.create(**serializer.validated_data)
+
+            GPSValidation.objects.create(
+                claim=claim,
+                origin=serializer.validated_data.get('origin', ''),
+                destination=serializer.validated_data.get('destination', ''),
+                base_distance_km=calculated_distance,
+                adjusted_distance_km=adjusted_distance,
+                threshold_pct=self._get_threshold_pct(),
+                errands_factor=errands_factor,
+                source="nominatim",
+            )
 
             claim_lines = []
             for item in allowances:
@@ -198,10 +446,104 @@ class ClaimView(viewsets.ModelViewSet):
         headers = self.get_success_headers(output.data)
         return Response(output.data, status=drf_status.HTTP_201_CREATED, headers=headers)
 
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        claim = serializer.save()
+
+        claimed_distance = serializer.validated_data.get('actual_mileage')
+        if claimed_distance is not None:
+            self._update_gps_validation(claim, claimed_distance)
+
+        return Response(self.get_serializer(claim).data)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
+
 
 class ClaimLineView(viewsets.ModelViewSet):
     serializer_class = ClaimLineSerializer
     queryset = ClaimLine.objects.all()
+
+    @action(detail=True, methods=['get', 'post'], url_path='receipts')
+    def receipts(self, request, pk=None):
+        claim_line = self.get_object()
+
+        if request.method.lower() == 'get':
+            receipts = Receipt.objects.filter(claim_line=claim_line)
+            serializer = ReceiptSerializer(receipts, many=True)
+            return Response(serializer.data)
+
+        files = request.FILES.getlist('files')
+        if not files:
+            return Response(
+                {"detail": "No files uploaded. Use multipart form-data with files."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        created = []
+        for uploaded in files:
+            receipt = Receipt.objects.create(
+                claim_line=claim_line,
+                file=uploaded,
+                file_name=uploaded.name,
+                file_type=getattr(uploaded, "content_type", "") or "",
+            )
+            ocr_payload = run_ocr(receipt.file.path)
+
+            match_status = "pending"
+            notes = []
+            total_amount = ocr_payload.get("total_amount")
+            receipt_date = ocr_payload.get("receipt_date")
+
+            line_total = (claim_line.quantity or 0) * (claim_line.amount or 0)
+            if total_amount is not None and line_total:
+                variance = abs(total_amount - line_total) / max(line_total, 1)
+                if variance <= 0.1:
+                    match_status = "valid"
+                else:
+                    match_status = "mismatch"
+                    notes.append("Amount does not match claim line total.")
+
+            claim = Claim.objects.filter(id=claim_line.claim_id).first()
+            if receipt_date and claim and claim.departure_date and claim.return_date:
+                if not (claim.departure_date.date() <= receipt_date <= claim.return_date.date()):
+                    match_status = "mismatch"
+                    notes.append("Receipt date outside travel dates.")
+
+            OCRResult.objects.create(
+                receipt=receipt,
+                vendor_name=ocr_payload.get("vendor_name", ""),
+                receipt_date=receipt_date,
+                total_amount=total_amount,
+                tax_amount=ocr_payload.get("tax_amount"),
+                receipt_number=ocr_payload.get("receipt_number", ""),
+                match_status=match_status,
+                notes=" ".join(notes),
+                raw_text=ocr_payload.get("raw_text", ""),
+            )
+            created.append(receipt)
+
+        serializer = ReceiptSerializer(created, many=True)
+        return Response(serializer.data, status=drf_status.HTTP_201_CREATED)
+
+
+class ReceiptView(viewsets.ModelViewSet):
+    serializer_class = ReceiptSerializer
+    queryset = Receipt.objects.all()
+
+
+class GPSValidationView(viewsets.ReadOnlyModelViewSet):
+    serializer_class = GPSValidationSerializer
+    queryset = GPSValidation.objects.all()
+
+
+class ThresholdConfigView(viewsets.ModelViewSet):
+    serializer_class = ThresholdConfigSerializer
+    queryset = ThresholdConfig.objects.all()
 
 
 def _choice_list(enum_class):
@@ -225,3 +567,115 @@ def enums_view(request):
 class LocationView(viewsets.ReadOnlyModelViewSet):
     serializer_class = LocationSerializer
     queryset = Location.objects.all().order_by('name')
+
+
+class IsAdminRole(BasePermission):
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_superuser:
+            return True
+        profile = getattr(user, "profile", None)
+        if not profile:
+            profile = UserProfile.objects.create(user=user)
+        return profile.role == UserRole.ADMIN
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login_view(request):
+    username = request.data.get('username')
+    password = request.data.get('password')
+
+    if not username or not password:
+        return Response(
+            {"detail": "username and password are required."},
+            status=drf_status.HTTP_400_BAD_REQUEST,
+        )
+
+    user = authenticate(request, username=username, password=password)
+    if not user:
+        return Response(
+            {"detail": "Invalid credentials."},
+            status=drf_status.HTTP_401_UNAUTHORIZED,
+        )
+
+    token, _ = Token.objects.get_or_create(user=user)
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+
+    return Response(
+        {
+            "token": token.key,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "role": profile.role,
+            },
+        }
+    )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout_view(request):
+    Token.objects.filter(user=request.user).delete()
+    return Response({"detail": "Logged out."})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def me_view(request):
+    serializer = UserSerializer(request.user)
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminRole])
+def users_view(request):
+    users = User.objects.all().order_by('username')
+    serializer = UserSerializer(users, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsAdminRole])
+def password_reset_view(request):
+    user_id = request.data.get('user_id')
+    username = request.data.get('username')
+    email = request.data.get('email')
+
+    user = None
+    if user_id:
+        user = User.objects.filter(id=user_id).first()
+    if not user and username:
+        user = User.objects.filter(username=username).first()
+    if not user and email:
+        user = User.objects.filter(email=email).first()
+
+    if not user:
+        return Response(
+            {"detail": "User not found."},
+            status=drf_status.HTTP_404_NOT_FOUND,
+        )
+
+    temp_password = get_random_string(12)
+    user.set_password(temp_password)
+    user.save(update_fields=["password"])
+
+    AuditLog.objects.create(
+        actor=request.user,
+        action="password_reset",
+        target_user=user,
+        metadata={"method": "temporary_password"},
+    )
+
+    return Response(
+        {
+            "detail": "Password reset. Share the temporary password with the user.",
+            "temporary_password": temp_password,
+        }
+    )

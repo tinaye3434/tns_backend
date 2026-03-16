@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
+    'rest_framework.authtoken',
     'tns_api'
 ]
 
@@ -76,14 +77,18 @@ WSGI_APPLICATION = 'tns_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
+db_engine = os.getenv('DATABASE_ENGINE', 'sqlite3')
+if '.' in db_engine:
+    engine_path = db_engine
+else:
+    engine_path = f'django.db.backends.{db_engine}'
+
 DATABASES = {
     'default': {
-         'ENGINE': 'django.db.backends.{}'.format(
-             os.getenv('DATABASE_ENGINE', 'sqlite3')
-         ),
+         'ENGINE': engine_path,
          'NAME': os.getenv('DATABASE_NAME', 'polls'),
          'USER': os.getenv('DATABASE_USERNAME', 'myprojectuser'),
-         'PASSWORD': os.getenv('DATABASE_PASSWORD', 'password'),
+         'PASSWORD': os.getenv('DATABASE_PASSWORD', ''),
          'HOST': os.getenv('DATABASE_HOST', '127.0.0.1'),
          'PORT': os.getenv('DATABASE_PORT', 5432),
      }
@@ -126,11 +131,20 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 CORS_ORIGIN_WHITELIST = [
      'http://localhost:3000'
 ]
 
 REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.AllowAny",
+    ],
     "EXCEPTION_HANDLER": "tns_api.exception_handler.api_exception_handler",
 }
 
@@ -155,3 +169,9 @@ LOGGING = {
         },
     },
 }
+
+# Email (dev default)
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend",
+)

@@ -1,5 +1,8 @@
 from django.db import models
 from django.db.models import Max
+from django.contrib.auth.models import User
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
 class Department(models.TextChoices):
     FINANCE = "FINANCE", "Finance"
@@ -41,6 +44,13 @@ class Location(models.Model):
         return self.name
 
 class Employee(models.Model):
+    user = models.OneToOneField(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="employee_profile",
+    )
     first_name = models.TextField()
     surname = models.TextField()
     email = models.EmailField()
@@ -89,6 +99,11 @@ class Allowance(models.Model):
 class ApprovalStage(models.Model):
     title = models.CharField(max_length=20)
     order = models.PositiveIntegerField(default=1, db_index=True)
+    employees = models.ManyToManyField(
+        "Employee",
+        blank=True,
+        related_name="approval_stages",
+    )
 
     def save(self, *args, **kwargs):
         if self._state.adding:
@@ -110,6 +125,7 @@ class Claim(models.Model):
     destination = models.TextField()
     user_distance = models.FloatField()
     calculated_distance = models.FloatField()
+    actual_mileage = models.FloatField(null=True, blank=True)
     total = models.FloatField()
     stage_id = models.IntegerField()
     status = models.CharField(
@@ -129,3 +145,131 @@ class ClaimLine(models.Model):
 
     def _str_(self):
         return str(self.claim_id)
+
+
+class Receipt(models.Model):
+    claim_line = models.ForeignKey(
+        ClaimLine,
+        on_delete=models.CASCADE,
+        related_name="receipts",
+    )
+    file = models.FileField(upload_to="receipts/")
+    file_name = models.CharField(max_length=255)
+    file_type = models.CharField(max_length=100, blank=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-uploaded_at"]
+
+    def __str__(self):
+        return self.file_name
+
+
+class OCRResult(models.Model):
+    receipt = models.OneToOneField(
+        Receipt,
+        on_delete=models.CASCADE,
+        related_name="ocr_result",
+    )
+    vendor_name = models.CharField(max_length=255, blank=True)
+    receipt_date = models.DateField(null=True, blank=True)
+    total_amount = models.FloatField(null=True, blank=True)
+    tax_amount = models.FloatField(null=True, blank=True)
+    receipt_number = models.CharField(max_length=100, blank=True)
+    match_status = models.CharField(max_length=20, default="pending")
+    notes = models.TextField(blank=True)
+    raw_text = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"OCR {self.receipt_id} ({self.match_status})"
+
+
+class ThresholdConfig(models.Model):
+    key = models.CharField(max_length=100, unique=True)
+    value = models.FloatField()
+    unit = models.CharField(max_length=50, blank=True)
+    description = models.TextField(blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["key"]
+
+    def __str__(self):
+        return f"{self.key}={self.value}"
+
+
+class GPSValidation(models.Model):
+    claim = models.OneToOneField(
+        Claim,
+        on_delete=models.CASCADE,
+        related_name="gps_validation",
+    )
+    origin = models.CharField(max_length=255)
+    destination = models.CharField(max_length=255)
+    base_distance_km = models.FloatField()
+    adjusted_distance_km = models.FloatField()
+    claimed_distance_km = models.FloatField(null=True, blank=True)
+    variance_km = models.FloatField(null=True, blank=True)
+    variance_pct = models.FloatField(null=True, blank=True)
+    threshold_pct = models.FloatField(default=0.15)
+    status = models.CharField(max_length=20, default="pending")
+    errands_factor = models.FloatField(default=1.2)
+    source = models.CharField(max_length=50, default="nominatim")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.origin} -> {self.destination}"
+
+
+class UserRole(models.TextChoices):
+    EMPLOYEE = "EMPLOYEE", "Employee"
+    APPROVER = "APPROVER", "Approver"
+    ADMIN = "ADMIN", "System Administrator"
+
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
+    role = models.CharField(max_length=20, choices=UserRole.choices, default=UserRole.EMPLOYEE)
+
+    def __str__(self):
+        return f"{self.user.username} ({self.role})"
+
+
+class AuditLog(models.Model):
+    actor = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_actions",
+    )
+    action = models.CharField(max_length=100)
+    target_user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_targets",
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        target = self.target_user.username if self.target_user else "unknown"
+        return f"{self.action} -> {target}"
+
+
+@receiver(post_save, sender=User)
+def ensure_user_profile(sender, instance, created, **kwargs):
+    if created:
+        UserProfile.objects.create(user=instance)

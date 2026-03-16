@@ -5,14 +5,16 @@ name = "pypi"
 
 [packages]
 asgiref = "==3.11.1"
+django = "==6.0.2"
+django-cors-headers = "==4.9.0"
 djangorestframework = "==3.16.1"
 gunicorn = "==23.0.0"
 packaging = "==26.0"
 psycopg2-binary = "==2.9.10"
+pytesseract = "==0.3.10"
+Pillow = "==10.4.0"
 sqlparse = "==0.5.5"
 tzdata = "==2025.3"
-django = "*"
-django-cors-headers = "*"
 
 [dev-packages]
 
