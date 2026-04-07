@@ -3,9 +3,16 @@
 import os
 import sys
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 
 def main():
     """Run administrative tasks."""
+    if load_dotenv:
+        load_dotenv()
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tns_backend.settings')
     try:
         from django.core.management import execute_from_command_line

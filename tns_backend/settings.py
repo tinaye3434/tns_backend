@@ -40,7 +40,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'rest_framework',
     'rest_framework.authtoken',
-    'tns_api'
+    'tns_api.apps.TnsApiConfig'
 ]
 
 MIDDLEWARE = [

@@ -36,12 +36,16 @@ router.register(r'cities', views.LocationView, 'city')
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include(router.urls)),
+    path('api/openai-health/', views.openai_health_view, name='openai-health'),
     path('api/enums/', views.enums_view, name='enums'),
     path('api/auth/login/', views.login_view, name='login'),
     path('api/auth/logout/', views.logout_view, name='logout'),
     path('api/auth/me/', views.me_view, name='me'),
     path('api/auth/password-reset/', views.password_reset_view, name='password-reset'),
     path('api/users/', views.users_view, name='users'),
+    path('api/fraud/train/', views.train_fraud_model_view, name='fraud-train'),
+    path('api/fraud/train-csv/', views.train_fraud_model_csv_view, name='fraud-train-csv'),
+    path('api/fraud/model/', views.fraud_model_status_view, name='fraud-model'),
 ]
 
 if settings.DEBUG:

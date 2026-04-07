@@ -32,6 +32,11 @@ class Status(models.IntegerChoices):
     ACTIVE = 1, "Active"
     INACTIVE = 0, "Inactive"
 
+class ApprovalStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+
 class Location(models.Model):
     name = models.CharField(max_length=100, unique=True)
     longitude = models.FloatField()
@@ -128,10 +133,11 @@ class Claim(models.Model):
     actual_mileage = models.FloatField(null=True, blank=True)
     total = models.FloatField()
     stage_id = models.IntegerField()
-    status = models.CharField(
-        max_length=1,
-        choices=Status.choices,
-        default=Status.ACTIVE
+    documents_submitted = models.BooleanField(default=False)
+    approval_status = models.CharField(
+        max_length=20,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.PENDING,
     )
 
     def _str_(self):
@@ -267,6 +273,52 @@ class AuditLog(models.Model):
     def __str__(self):
         target = self.target_user.username if self.target_user else "unknown"
         return f"{self.action} -> {target}"
+
+
+class FraudModelSnapshot(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+    model_blob = models.BinaryField()
+    feature_columns = models.JSONField(default=list, blank=True)
+    feature_means = models.JSONField(default=list, blank=True)
+    feature_stds = models.JSONField(default=list, blank=True)
+    score_p05 = models.FloatField(default=0.0)
+    score_p95 = models.FloatField(default=1.0)
+    training_rows = models.IntegerField(default=0)
+    trained_from = models.DateTimeField(null=True, blank=True)
+    trained_to = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"FraudModelSnapshot {self.id}"
+
+
+class FraudScore(models.Model):
+    claim = models.OneToOneField(
+        Claim,
+        on_delete=models.CASCADE,
+        related_name="fraud_score",
+    )
+    model_snapshot = models.ForeignKey(
+        FraudModelSnapshot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scores",
+    )
+    score = models.FloatField()
+    raw_score = models.FloatField()
+    risk_level = models.CharField(max_length=10, default="medium")
+    features = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"FraudScore {self.claim_id}: {self.score:.2f}"
 
 
 @receiver(post_save, sender=User)

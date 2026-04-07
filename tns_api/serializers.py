@@ -8,12 +8,14 @@ from .models import (
     ClaimLine,
     Location,
     Status,
+    ApprovalStatus,
     UserProfile,
     UserRole,
     Receipt,
     GPSValidation,
     OCRResult,
     ThresholdConfig,
+    FraudScore,
 )
 
 class StatusDefaultMixin:
@@ -57,7 +59,7 @@ class ApprovalStageSerializer(serializers.ModelSerializer):
         model = ApprovalStage
         fields = ('id', 'title', 'order', 'employee_ids')
         
-class ClaimsSerializer(StatusDefaultMixin, serializers.ModelSerializer):
+class ClaimsSerializer(serializers.ModelSerializer):
     allowances = serializers.ListField(
         child=serializers.DictField(),
         required=False,
@@ -86,12 +88,13 @@ class ClaimsSerializer(StatusDefaultMixin, serializers.ModelSerializer):
             'total',
             'total_allowances',
             'stage_id',
-            'status',
+            'documents_submitted',
+            'approval_status',
             'allowances',
             'auto_distance',
         )
         extra_kwargs = {
-            'status': {'required': False},
+            'approval_status': {'required': False},
             'user_distance': {'required': False},
             'calculated_distance': {'required': False},
             'actual_mileage': {'required': False},
@@ -192,6 +195,22 @@ class ThresholdConfigSerializer(serializers.ModelSerializer):
                 f"Invalid key. Allowed keys: {', '.join(sorted(self.ALLOWED_KEYS))}."
             )
         return value
+
+
+class FraudScoreSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FraudScore
+        fields = (
+            'id',
+            'claim',
+            'model_snapshot',
+            'score',
+            'raw_score',
+            'risk_level',
+            'features',
+            'created_at',
+            'updated_at',
+        )
 
 
 class UserSerializer(serializers.ModelSerializer):
