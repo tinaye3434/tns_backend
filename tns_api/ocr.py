@@ -6,6 +6,8 @@ from datetime import datetime
 import logging
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
+import socket
+import ssl
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,29 @@ def _extract_output_text(response):
             if content.get("type") in ("output_text", "text"):
                 return content.get("text", "")
     return ""
+
+def _describe_http_error(error):
+    detail = None
+    try:
+        raw = error.read().decode("utf-8")
+    except Exception:
+        raw = ""
+
+    if raw:
+        try:
+            payload = json.loads(raw)
+            detail = (
+                payload.get("error", {}).get("message")
+                or payload.get("message")
+                or raw
+            )
+        except (ValueError, TypeError):
+            detail = raw
+
+    if not detail:
+        detail = str(error.reason) if error.reason else "HTTP error."
+
+    return detail.strip()
 
 
 def run_ocr(path):
@@ -100,7 +125,7 @@ def run_ocr(path):
                 "role": "system",
                 "content": [
                     {
-                        "type": "text",
+                        "type": "input_text",
                         "text": (
                             "You are an OCR engine for receipts. "
                             "Extract fields from the image. If a field is missing, use null "
@@ -143,7 +168,13 @@ def run_ocr(path):
             body = response.read().decode("utf-8")
         logger.info("OpenAI OCR request completed with status=%s path=%s", response.status, path)
     except HTTPError as error:
-        logger.warning("OpenAI OCR request failed HTTP %s path=%s", error.code, path)
+        description = _describe_http_error(error)
+        logger.warning(
+            "OpenAI OCR request failed HTTP %s path=%s detail=%s",
+            error.code,
+            path,
+            description,
+        )
         return {
             "raw_text": "",
             "vendor_name": "",
@@ -151,10 +182,10 @@ def run_ocr(path):
             "total_amount": None,
             "tax_amount": None,
             "receipt_number": "",
-            "notes": f"OpenAI OCR failed: HTTP {error.code}",
+            "notes": f"OpenAI OCR failed: HTTP {error.code} - {description}",
         }
-    except URLError:
-        logger.warning("OpenAI OCR request failed network error path=%s", path)
+    except (socket.timeout, TimeoutError):
+        logger.warning("OpenAI OCR request timed out path=%s", path)
         return {
             "raw_text": "",
             "vendor_name": "",
@@ -162,7 +193,31 @@ def run_ocr(path):
             "total_amount": None,
             "tax_amount": None,
             "receipt_number": "",
-            "notes": "OpenAI OCR failed: network error.",
+            "notes": "OpenAI OCR failed: request timed out.",
+        }
+    except ssl.SSLError as error:
+        logger.warning("OpenAI OCR request failed SSL error path=%s detail=%s", path, error)
+        return {
+            "raw_text": "",
+            "vendor_name": "",
+            "receipt_date": None,
+            "total_amount": None,
+            "tax_amount": None,
+            "receipt_number": "",
+            "notes": f"OpenAI OCR failed: SSL error - {error}",
+        }
+    except URLError as error:
+        reason = error.reason
+        reason_text = str(reason) if reason else "Network error."
+        logger.warning("OpenAI OCR request failed network error path=%s detail=%s", path, reason_text)
+        return {
+            "raw_text": "",
+            "vendor_name": "",
+            "receipt_date": None,
+            "total_amount": None,
+            "tax_amount": None,
+            "receipt_number": "",
+            "notes": f"OpenAI OCR failed: network error - {reason_text}",
         }
 
     try:

@@ -12,6 +12,8 @@ from django.core.mail import send_mail
 from urllib import request as urlrequest
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
+import socket
+import ssl
 import json
 import math
 from datetime import timedelta
@@ -940,12 +942,38 @@ def openai_health_view(request):
     except HTTPError as error:
         status = "unauthorized" if error.code == 401 else "error"
         return Response(
-            {"configured": True, "status": status, "detail": f"HTTP {error.code}"},
+            {
+                "configured": True,
+                "status": status,
+                "detail": f"HTTP {error.code}: {error.reason}",
+            },
             status=drf_status.HTTP_200_OK,
         )
-    except URLError:
+    except (socket.timeout, TimeoutError):
         return Response(
-            {"configured": True, "status": "network_error", "detail": "Network error."},
+            {"configured": True, "status": "timeout", "detail": "Request timed out."},
+            status=drf_status.HTTP_200_OK,
+        )
+    except ssl.SSLError as error:
+        return Response(
+            {"configured": True, "status": "ssl_error", "detail": f"SSL error: {error}"},
+            status=drf_status.HTTP_200_OK,
+        )
+    except URLError as error:
+        reason = error.reason
+        reason_text = str(reason) if reason else "Unknown network error."
+        return Response(
+            {"configured": True, "status": "network_error", "detail": reason_text},
+            status=drf_status.HTTP_200_OK,
+        )
+    except Exception as error:
+        logger.exception("OpenAI health check failed.")
+        return Response(
+            {
+                "configured": True,
+                "status": "error",
+                "detail": f"{error.__class__.__name__}: {error}",
+            },
             status=drf_status.HTTP_200_OK,
         )
 
