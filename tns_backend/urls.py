@@ -43,6 +43,7 @@ urlpatterns = [
     path('api/auth/me/', views.me_view, name='me'),
     path('api/auth/password-reset/', views.password_reset_view, name='password-reset'),
     path('api/users/', views.users_view, name='users'),
+    path('api/users/<int:user_id>/role/', views.user_role_update_view, name='user-role-update'),
     path('api/fraud/train/', views.train_fraud_model_view, name='fraud-train'),
     path('api/fraud/train-csv/', views.train_fraud_model_csv_view, name='fraud-train-csv'),
     path('api/fraud/model/', views.fraud_model_status_view, name='fraud-model'),

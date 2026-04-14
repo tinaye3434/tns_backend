@@ -223,7 +223,7 @@ class ApprovalStageView(viewsets.ModelViewSet):
                     if not employee.user:
                         continue
                     profile, _ = UserProfile.objects.get_or_create(user=employee.user)
-                    if profile.role != UserRole.ADMIN:
+                    if profile.role not in {UserRole.ADMIN, UserRole.SUPERUSER}:
                         profile.role = UserRole.APPROVER
                         profile.save(update_fields=["role"])
 
@@ -232,7 +232,7 @@ class ApprovalStageView(viewsets.ModelViewSet):
                     if not employee.user:
                         continue
                     profile, _ = UserProfile.objects.get_or_create(user=employee.user)
-                    if profile.role == UserRole.ADMIN:
+                    if profile.role in {UserRole.ADMIN, UserRole.SUPERUSER}:
                         continue
                     remaining = employee.approval_stages.exclude(id=stage.id).exists()
                     if not remaining:
@@ -578,6 +578,93 @@ class ClaimView(viewsets.ModelViewSet):
         kwargs['partial'] = True
         return self.update(request, *args, **kwargs)
 
+    @action(detail=True, methods=['post'], url_path='decision')
+    def decision(self, request, pk=None):
+        claim = self.get_object()
+        user = request.user
+        if not user or not user.is_authenticated:
+            return Response(
+                {"detail": "Authentication required."},
+                status=drf_status.HTTP_401_UNAUTHORIZED,
+            )
+
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        if profile.role not in {UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPERUSER}:
+            return Response(
+                {"detail": "You do not have permission to action claims."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+
+        if claim.approval_status != ApprovalStatus.PENDING:
+            return Response(
+                {"detail": "Only pending claims can be actioned."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        decision = (request.data.get("decision") or "").strip().lower()
+        justification = (request.data.get("justification") or "").strip()
+        if decision not in {"approve", "deny", "reject"}:
+            return Response(
+                {"detail": "decision must be either 'approve' or 'deny'."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not justification:
+            return Response(
+                {"detail": "A justification is required."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        if decision == "approve":
+            current_stage = ApprovalStage.objects.filter(id=claim.stage_id).first()
+            next_stage = None
+            if current_stage:
+                next_stage = (
+                    ApprovalStage.objects.filter(order__gt=current_stage.order)
+                    .order_by("order", "id")
+                    .first()
+                )
+            else:
+                next_stage = ApprovalStage.objects.order_by("order", "id").first()
+
+            if next_stage:
+                claim.stage_id = next_stage.id
+                claim.save(update_fields=["stage_id"])
+                detail = f"Claim approved and moved to stage {next_stage.id}."
+            else:
+                claim.approval_status = ApprovalStatus.APPROVED
+                claim.save(update_fields=["approval_status"])
+                detail = "Claim approved."
+
+            audit_action = "claim_approved"
+        else:
+            claim.approval_status = ApprovalStatus.REJECTED
+            claim.save(update_fields=["approval_status"])
+            detail = "Claim rejected."
+            audit_action = "claim_rejected"
+
+        AuditLog.objects.create(
+            actor=user,
+            action=audit_action,
+            target_user=None,
+            metadata={
+                "claim_id": claim.id,
+                "decision": "approve" if decision == "approve" else "deny",
+                "justification": justification,
+                "stage_id": claim.stage_id,
+                "approval_status": claim.approval_status,
+            },
+        )
+
+        serializer = self.get_serializer(claim)
+        return Response(
+            {
+                "detail": detail,
+                "claim": serializer.data,
+            },
+            status=drf_status.HTTP_200_OK,
+        )
+
     @action(detail=True, methods=['post'], url_path='submit-documents')
     def submit_documents(self, request, pk=None):
         claim = self.get_object()
@@ -915,6 +1002,7 @@ def enums_view(request):
             "tns_classification": _choice_list(TnsClassifications),
             "status": _choice_list(Status),
             "approval_status": _choice_list(ApprovalStatus),
+            "user_role": _choice_list(UserRole),
         }
     )
 
@@ -993,7 +1081,7 @@ class IsAdminRole(BasePermission):
         profile = getattr(user, "profile", None)
         if not profile:
             profile = UserProfile.objects.create(user=user)
-        return profile.role == UserRole.ADMIN
+        return profile.role in {UserRole.ADMIN, UserRole.SUPERUSER}
 
 
 @api_view(['POST'])
@@ -1048,7 +1136,7 @@ def me_view(request):
 
 
 @api_view(['GET'])
-# @permission_classes([IsAuthenticated, IsAdminRole])
+@permission_classes([IsAuthenticated, IsAdminRole])
 def users_view(request):
     users = User.objects.all().order_by('username')
     serializer = UserSerializer(users, many=True)
@@ -1056,7 +1144,45 @@ def users_view(request):
 
 
 @api_view(['POST'])
-# @permission_classes([IsAuthenticated, IsAdminRole])
+@permission_classes([IsAuthenticated, IsAdminRole])
+def user_role_update_view(request, user_id):
+    try:
+        target_user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return Response(
+            {"detail": "User not found."},
+            status=drf_status.HTTP_404_NOT_FOUND,
+        )
+
+    role = (request.data.get("role") or "").strip().upper()
+    valid_roles = {choice for choice, _label in UserRole.choices}
+    if role not in valid_roles:
+        return Response(
+            {"detail": f"Invalid role. Allowed roles: {', '.join(sorted(valid_roles))}."},
+            status=drf_status.HTTP_400_BAD_REQUEST,
+        )
+
+    profile, _ = UserProfile.objects.get_or_create(user=target_user)
+    previous_role = profile.role
+    if previous_role != role:
+        profile.role = role
+        profile.save(update_fields=["role"])
+        AuditLog.objects.create(
+            actor=request.user,
+            action="role_updated",
+            target_user=target_user,
+            metadata={
+                "previous_role": previous_role,
+                "new_role": role,
+            },
+        )
+
+    serializer = UserSerializer(target_user)
+    return Response(serializer.data, status=drf_status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsAdminRole])
 def password_reset_view(request):
     user_id = request.data.get('user_id')
     username = request.data.get('username')

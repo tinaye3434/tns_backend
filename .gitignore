@@ -1,6 +1,44 @@
-*.pyc
-venv/
+# Python
 __pycache__/
-staticfiles/
-db.sqlite3
+*.py[cod]
+*.pyd
+*.pyo
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+venv/
+.venv/
+env/
 .env
+.env/
+.env.*
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+
+# Training data
+fraud_training_*.csv
+
+# Logs
+*.log
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# IDEs
+.idea/
+.vscode/

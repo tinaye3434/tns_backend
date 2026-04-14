@@ -238,6 +238,7 @@ class UserRole(models.TextChoices):
     EMPLOYEE = "EMPLOYEE", "Employee"
     APPROVER = "APPROVER", "Approver"
     ADMIN = "ADMIN", "System Administrator"
+    SUPERUSER = "SUPERUSER", "Super User"
 
 
 class UserProfile(models.Model):

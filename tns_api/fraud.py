@@ -4,22 +4,16 @@ from datetime import timedelta
 from typing import Iterable, List, Dict, Tuple
 
 import numpy as np
-from django.db.models import Count, F, FloatField, Sum
-from django.db.models.expressions import ExpressionWrapper
 from sklearn.ensemble import IsolationForest
 
-from .models import Claim, ClaimLine, FraudModelSnapshot, FraudScore
+from .models import Claim, FraudModelSnapshot, FraudScore
 
 FEATURE_COLUMNS = [
     "claim_total",
-    "claim_line_sum",
-    "avg_line_amount",
     "claims_last_30d",
     "claims_last_90d",
     "days_since_last_claim",
     "claim_duration_days",
-    "departure_hour",
-    "departure_weekday",
 ]
 
 
@@ -94,57 +88,25 @@ def build_feature_matrix(claims: Iterable[Claim]) -> Tuple[np.ndarray, List[int]
 
     claim_ids = [claim.id for claim in claims]
 
-    line_amount_expr = ExpressionWrapper(
-        F("quantity") * F("amount"), output_field=FloatField()
-    )
-    line_aggregates = (
-        ClaimLine.objects.filter(claim_id__in=claim_ids)
-        .values("claim_id")
-        .annotate(
-            total=Sum(line_amount_expr),
-            count=Count("id"),
-        )
-    )
-    line_map = {
-        int(item["claim_id"]): {
-            "total": float(item["total"] or 0.0),
-            "count": float(item["count"] or 0.0),
-        }
-        for item in line_aggregates
-    }
-
     history_map = _build_history_maps(claims)
 
     feature_rows: List[List[float]] = []
     claim_id_order: List[int] = []
 
     for claim in claims:
-        line_info = line_map.get(int(claim.id), {"total": 0.0, "count": 0.0})
-        line_total = line_info["total"]
-        line_count = line_info["count"]
-        avg_line_amount = line_total / max(line_count, 1.0)
-
         history = history_map.get(int(claim.id), {
             "claims_last_30d": 0.0,
             "claims_last_90d": 0.0,
             "days_since_last_claim": 999.0,
         })
 
-        departure = claim.departure_date
-        departure_hour = float(departure.hour) if departure else 0.0
-        departure_weekday = float(departure.weekday()) if departure else 0.0
-
         feature_rows.append(
             [
                 float(claim.total or 0.0),
-                float(line_total),
-                float(avg_line_amount),
                 float(history["claims_last_30d"]),
                 float(history["claims_last_90d"]),
                 float(history["days_since_last_claim"]),
                 float(_claim_duration_days(claim)),
-                float(departure_hour),
-                float(departure_weekday),
             ]
         )
         claim_id_order.append(int(claim.id))
@@ -250,6 +212,11 @@ def _risk_level(score: float) -> str:
         return "medium"
     return "low"
 
+def _apply_low_total_rule(claim: Claim, score: float, level: str) -> tuple[float, str]:
+    if (claim.total or 0.0) < 500:
+        return min(score, 39.9), "low"
+    return score, level
+
 
 def score_claims(claims: Iterable[Claim], snapshot: FraudModelSnapshot) -> List[Dict]:
     claims = list(claims)
@@ -275,6 +242,7 @@ def score_claims(claims: Iterable[Claim], snapshot: FraudModelSnapshot) -> List[
         claim = next((c for c in claims if int(c.id) == int(claim_id)), None)
         if claim is None:
             continue
+        score, level = _apply_low_total_rule(claim, score, level)
 
         FraudScore.objects.update_or_create(
             claim=claim,
