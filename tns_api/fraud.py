@@ -5,8 +5,9 @@ from typing import Iterable, List, Dict, Tuple
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
+from django.utils import timezone
 
-from .models import Claim, FraudModelSnapshot, FraudScore
+from .models import Claim, ClaimLine, FraudModelSnapshot, FraudScore, GPSValidation, OCRResult
 
 FEATURE_COLUMNS = [
     "claim_total",
@@ -212,10 +213,286 @@ def _risk_level(score: float) -> str:
         return "medium"
     return "low"
 
-def _apply_low_total_rule(claim: Claim, score: float, level: str) -> tuple[float, str]:
-    if (claim.total or 0.0) < 500:
-        return min(score, 39.9), "low"
-    return score, level
+
+RULE_WEIGHTS = {
+    "monthly_days_exceeded": 30.0,
+    "monthly_trip_count_exceeded": 20.0,
+    "high_monthly_trip_count": 15.0,
+    "repeated_same_route": 15.0,
+    "claims_too_close_together": 15.0,
+    "mileage_anomaly": 35.0,
+    "weekend_concentration": 10.0,
+    "repeated_receipt_amounts": 15.0,
+    "claim_total_above_employee_norm": 20.0,
+    "claim_total_far_above_employee_norm": 15.0,
+    "short_trip_high_amount": 25.0,
+    "multiple_same_day_claims": 15.0,
+    "delayed_or_missing_receipts": 20.0,
+    "threshold_gaming": 30.0,
+}
+
+HIGH_SEVERITY_RULES = {
+    "monthly_days_exceeded",
+    "high_monthly_trip_count",
+    "mileage_anomaly",
+    "claim_total_far_above_employee_norm",
+    "short_trip_high_amount",
+    "delayed_or_missing_receipts",
+    "threshold_gaming",
+}
+
+AUTO_APPROVE_HARD_STOPS = {
+    "monthly_days_exceeded",
+    "high_monthly_trip_count",
+    "mileage_anomaly",
+    "delayed_or_missing_receipts",
+    "threshold_gaming",
+    "short_trip_high_amount",
+}
+
+
+def _month_bounds(dt):
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return start, end
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _claim_day_span(claim: Claim) -> float:
+    return float(claim.days or _claim_duration_days(claim) or 0.0)
+
+
+def _build_rule_flags(claim: Claim) -> List[Dict[str, object]]:
+    if not claim.departure_date:
+        return []
+
+    flags: List[Dict[str, object]] = []
+    month_start, month_end = _month_bounds(claim.departure_date)
+    employee_claims = list(
+        Claim.objects.filter(employee_id=claim.employee_id)
+        .exclude(id=claim.id)
+        .order_by("departure_date", "id")
+    )
+    monthly_claims = [
+        item
+        for item in employee_claims
+        if item.departure_date and month_start <= item.departure_date < month_end
+    ]
+    monthly_days = sum(_claim_day_span(item) for item in monthly_claims) + _claim_day_span(claim)
+    monthly_trip_count = len(monthly_claims) + 1
+
+    if monthly_days > 12:
+        flags.append(
+            {
+                "code": "monthly_days_exceeded",
+                "severity": "high",
+                "message": f"Monthly claimed days reached {monthly_days:.1f}, above the limit of 12.",
+            }
+        )
+
+    if monthly_trip_count > 2:
+        severity = "high" if monthly_trip_count > 4 else "medium"
+        flags.append(
+            {
+                "code": "high_monthly_trip_count" if severity == "high" else "monthly_trip_count_exceeded",
+                "severity": severity,
+                "message": f"Employee has {monthly_trip_count} trips in the same month.",
+            }
+        )
+
+    recent_30d = [
+        item
+        for item in employee_claims
+        if item.departure_date and 0 <= (claim.departure_date - item.departure_date).days <= 30
+    ]
+    same_route_count = sum(
+        1
+        for item in recent_30d
+        if (item.origin or "").strip().lower() == (claim.origin or "").strip().lower()
+        and (item.destination or "").strip().lower() == (claim.destination or "").strip().lower()
+    )
+    if same_route_count >= 3:
+        flags.append(
+            {
+                "code": "repeated_same_route",
+                "severity": "medium",
+                "message": f"Same route repeated {same_route_count + 1} times in 30 days.",
+            }
+        )
+
+    previous_claims = [item for item in employee_claims if item.departure_date and item.departure_date < claim.departure_date]
+    if previous_claims:
+        previous = previous_claims[-1]
+        gap_days = (claim.departure_date - previous.departure_date).days
+        if gap_days < 3:
+            flags.append(
+                {
+                    "code": "claims_too_close_together",
+                    "severity": "medium",
+                    "message": f"Only {gap_days} day(s) since the previous claim.",
+                }
+            )
+
+    gps_validation = GPSValidation.objects.filter(claim=claim).first()
+    variance_pct = _safe_float(getattr(gps_validation, "variance_pct", None))
+    if variance_pct > 0.15:
+        flags.append(
+            {
+                "code": "mileage_anomaly",
+                "severity": "high",
+                "message": f"Mileage variance is {variance_pct * 100:.1f}%, above the 15% threshold.",
+            }
+        )
+
+    weekend_claims = sum(
+        1
+        for item in recent_30d
+        if item.departure_date and item.departure_date.weekday() >= 5
+    )
+    if claim.departure_date.weekday() >= 5 and weekend_claims >= 2:
+        flags.append(
+            {
+                "code": "weekend_concentration",
+                "severity": "medium",
+                "message": "Repeated weekend claim departures detected in the last 30 days.",
+            }
+        )
+
+    prior_totals = [_safe_float(item.total) for item in employee_claims if item.total is not None]
+    if prior_totals:
+        average_total = sum(prior_totals) / len(prior_totals)
+        claim_total = _safe_float(claim.total)
+        if average_total > 0 and claim_total > average_total * 2.5:
+            flags.append(
+                {
+                    "code": "claim_total_far_above_employee_norm",
+                    "severity": "high",
+                    "message": f"Claim total is more than 2.5x the employee average of {average_total:.2f}.",
+                }
+            )
+        elif average_total > 0 and claim_total > average_total * 1.75:
+            flags.append(
+                {
+                    "code": "claim_total_above_employee_norm",
+                    "severity": "medium",
+                    "message": f"Claim total is more than 1.75x the employee average of {average_total:.2f}.",
+                }
+            )
+
+    if _claim_day_span(claim) <= 1 and _safe_float(claim.total) > 800:
+        flags.append(
+            {
+                "code": "short_trip_high_amount",
+                "severity": "high",
+                "message": "Short trip with unusually high claim total.",
+            }
+        )
+
+    same_day_count = sum(
+        1
+        for item in employee_claims
+        if item.departure_date and item.departure_date.date() == claim.departure_date.date()
+    )
+    if same_day_count >= 1:
+        flags.append(
+            {
+                "code": "multiple_same_day_claims",
+                "severity": "medium",
+                "message": "Multiple claims share the same departure day.",
+            }
+        )
+
+    if claim.return_date and not claim.documents_submitted:
+        overdue_days = (timezone.now() - claim.return_date).days
+        if overdue_days > 3:
+            flags.append(
+                {
+                    "code": "delayed_or_missing_receipts",
+                    "severity": "high",
+                    "message": f"Receipts are overdue by {overdue_days} day(s).",
+                }
+            )
+
+    threshold_gaming_count = sum(
+        1
+        for item in recent_30d
+        if 450 <= _safe_float(item.total) <= 500
+    )
+    if 450 <= _safe_float(claim.total) <= 500 and threshold_gaming_count >= 2:
+        flags.append(
+            {
+                "code": "threshold_gaming",
+                "severity": "high",
+                "message": "Multiple claims are clustered just below the easy-approval threshold.",
+            }
+        )
+
+    recent_claim_ids = [item.id for item in recent_30d if item.id]
+    if recent_claim_ids:
+        claim_line_ids = list(
+            ClaimLine.objects.filter(claim_id__in=recent_claim_ids).values_list("id", flat=True)
+        )
+        if claim_line_ids:
+            amounts = list(
+                OCRResult.objects.filter(receipt__claim_line_id__in=claim_line_ids, total_amount__isnull=False)
+                .values_list("total_amount", flat=True)
+            )
+            repeated_amounts = defaultdict(int)
+            for amount in amounts:
+                rounded = round(_safe_float(amount), 2)
+                repeated_amounts[rounded] += 1
+            if repeated_amounts and max(repeated_amounts.values()) >= 3:
+                flags.append(
+                    {
+                        "code": "repeated_receipt_amounts",
+                        "severity": "medium",
+                        "message": "Receipt totals repeat unusually often across recent claims.",
+                    }
+                )
+
+    return flags
+
+
+def _combine_scores(claim: Claim, model_score: float) -> tuple[float, str, List[Dict[str, object]], bool, bool]:
+    flags = _build_rule_flags(claim)
+    total = _safe_float(claim.total)
+    hard_stop = any(flag["code"] in AUTO_APPROVE_HARD_STOPS for flag in flags)
+    auto_approve = total <= 500 and not hard_stop
+
+    if auto_approve:
+        flags.insert(
+            0,
+            {
+                "code": "low_total_auto_approve",
+                "severity": "info",
+                "message": "Claim total is 500 or less and no hard-stop rules were triggered.",
+            },
+        )
+        return 10.0, "low", flags, True, False
+
+    rule_penalty = sum(RULE_WEIGHTS.get(str(flag["code"]), 0.0) for flag in flags)
+    medium_flags = sum(1 for flag in flags if flag["severity"] == "medium")
+    high_flags = sum(1 for flag in flags if flag["severity"] == "high")
+    final_score = max(0.0, min(100.0, model_score + rule_penalty))
+    final_level = _risk_level(final_score)
+
+    if high_flags >= 1 or medium_flags >= 2:
+        final_level = "high" if high_flags >= 1 else "medium"
+        final_score = max(final_score, 70.0 if high_flags >= 1 else 45.0)
+
+    manual_review = high_flags >= 1 or medium_flags >= 2
+    return final_score, final_level, flags, False, manual_review
 
 
 def score_claims(claims: Iterable[Claim], snapshot: FraudModelSnapshot) -> List[Dict]:
@@ -237,12 +514,18 @@ def score_claims(claims: Iterable[Claim], snapshot: FraudModelSnapshot) -> List[
         raw = float(raw_scores[idx])
         score = _scale_score(raw, snapshot.score_p05, snapshot.score_p95)
         level = _risk_level(score)
-        features = {FEATURE_COLUMNS[i]: float(x[idx, i]) for i in range(len(FEATURE_COLUMNS))}
+        base_features = {FEATURE_COLUMNS[i]: float(x[idx, i]) for i in range(len(FEATURE_COLUMNS))}
 
         claim = next((c for c in claims if int(c.id) == int(claim_id)), None)
         if claim is None:
             continue
-        score, level = _apply_low_total_rule(claim, score, level)
+        score, level, rule_flags, auto_approve, manual_review = _combine_scores(claim, score)
+        features = {
+            **base_features,
+            "rule_flags": rule_flags,
+            "auto_approve": auto_approve,
+            "manual_review_required": manual_review,
+        }
 
         FraudScore.objects.update_or_create(
             claim=claim,
@@ -262,6 +545,9 @@ def score_claims(claims: Iterable[Claim], snapshot: FraudModelSnapshot) -> List[
                 "raw_score": raw,
                 "risk_level": level,
                 "features": features,
+                "rule_flags": rule_flags,
+                "auto_approve": auto_approve,
+                "manual_review_required": manual_review,
                 "model_snapshot_id": snapshot.id,
             }
         )

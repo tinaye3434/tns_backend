@@ -39,6 +39,7 @@ urlpatterns = [
     path('api/openai-health/', views.openai_health_view, name='openai-health'),
     path('api/enums/', views.enums_view, name='enums'),
     path('api/auth/login/', views.login_view, name='login'),
+    path('api/auth/signup/', views.signup_view, name='signup'),
     path('api/auth/logout/', views.logout_view, name='logout'),
     path('api/auth/me/', views.me_view, name='me'),
     path('api/auth/password-reset/', views.password_reset_view, name='password-reset'),

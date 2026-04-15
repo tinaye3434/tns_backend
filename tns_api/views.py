@@ -65,6 +65,67 @@ from .ocr import run_ocr
 logger = logging.getLogger(__name__)
 
 
+def _create_employee_with_user(
+    serializer,
+    password: str | None = None,
+    role: str = UserRole.EMPLOYEE,
+):
+    with transaction.atomic():
+        employee = serializer.save()
+
+        temp_password = None
+        user = getattr(employee, "user", None)
+        if employee.user_id is None:
+            username = (employee.email or "").strip()
+            if not username:
+                raise serializers.ValidationError({"email": "Email is required to create a user."})
+
+            user = User.objects.filter(username=username).first()
+            if not user and employee.email:
+                user = User.objects.filter(email=employee.email).first()
+
+            if user and getattr(user, "employee_profile", None):
+                raise serializers.ValidationError(
+                    {"email": "A user with this email is already linked to an employee."}
+                )
+
+            if not user:
+                user = User.objects.create(
+                    username=username,
+                    email=employee.email,
+                    first_name=employee.first_name,
+                    last_name=employee.surname,
+                    is_active=True,
+                )
+                chosen_password = password or get_random_string(12)
+                if password is None:
+                    temp_password = chosen_password
+                user.set_password(chosen_password)
+                user.save(update_fields=["password"])
+
+            updated_fields = []
+            if not user.email and employee.email:
+                user.email = employee.email
+                updated_fields.append("email")
+            if not user.first_name and employee.first_name:
+                user.first_name = employee.first_name
+                updated_fields.append("first_name")
+            if not user.last_name and employee.surname:
+                user.last_name = employee.surname
+                updated_fields.append("last_name")
+            if updated_fields:
+                user.save(update_fields=updated_fields)
+
+            employee.user = user
+            employee.save(update_fields=["user"])
+
+        profile, _ = UserProfile.objects.get_or_create(user=user or employee.user)
+        profile.role = role
+        profile.save(update_fields=["role"])
+
+    return employee, (user or employee.user), temp_password
+
+
 def _build_ocr_result(receipt, claim_line, claim, ocr_payload):
     match_status = "processed"
     notes = []
@@ -251,55 +312,7 @@ class EmployeeView(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        with transaction.atomic():
-            employee = serializer.save()
-
-            temp_password = None
-            if employee.user_id is None:
-                username = (employee.email or "").strip()
-                if not username:
-                    raise serializers.ValidationError({"email": "Email is required to create a user."})
-
-                user = User.objects.filter(username=username).first()
-                if not user and employee.email:
-                    user = User.objects.filter(email=employee.email).first()
-
-                if user and getattr(user, "employee_profile", None):
-                    raise serializers.ValidationError(
-                        {"email": "A user with this email is already linked to an employee."}
-                    )
-
-                if not user:
-                    user = User.objects.create(
-                        username=username,
-                        email=employee.email,
-                        first_name=employee.first_name,
-                        last_name=employee.surname,
-                        is_active=True,
-                    )
-                    temp_password = get_random_string(12)
-                    user.set_password(temp_password)
-                    user.save(update_fields=["password"])
-
-                updated_fields = []
-                if not user.email and employee.email:
-                    user.email = employee.email
-                    updated_fields.append("email")
-                if not user.first_name and employee.first_name:
-                    user.first_name = employee.first_name
-                    updated_fields.append("first_name")
-                if not user.last_name and employee.surname:
-                    user.last_name = employee.surname
-                    updated_fields.append("last_name")
-                if updated_fields:
-                    user.save(update_fields=updated_fields)
-
-                employee.user = user
-                employee.save(update_fields=["user"])
-
-                profile, _ = UserProfile.objects.get_or_create(user=user)
-                profile.role = UserRole.EMPLOYEE
-                profile.save(update_fields=["role"])
+        employee, user, temp_password = _create_employee_with_user(serializer)
 
         output = self.get_serializer(employee).data
         if temp_password:
@@ -444,7 +457,19 @@ class ClaimView(viewsets.ModelViewSet):
             except (TypeError, ValueError):
                 raise serializers.ValidationError({"employee": "Employee must be an integer id."})
 
+        if serializer.validated_data.get('employee_id') is None:
+            authenticated_user = getattr(request, "user", None)
+            if authenticated_user and authenticated_user.is_authenticated:
+                employee = Employee.objects.filter(user=authenticated_user).first()
+                if employee:
+                    serializer.validated_data['employee_id'] = employee.id
+
         employee_id = serializer.validated_data.get('employee_id')
+        if employee_id is None:
+            raise serializers.ValidationError(
+                {"detail": "Unable to determine the employee for this claim."}
+            )
+
         if employee_id is not None:
             pending_claim = (
                 Claim.objects.filter(
@@ -540,7 +565,7 @@ class ClaimView(viewsets.ModelViewSet):
         snapshot = fraud.get_latest_model_snapshot()
         if snapshot:
             results = fraud.score_claims([claim], snapshot)
-            if results and results[0].get("risk_level") == "low":
+            if results and results[0].get("auto_approve"):
                 final_stage = ApprovalStage.objects.order_by("-order", "-id").first()
                 if final_stage:
                     claim.stage_id = final_stage.id
@@ -554,6 +579,7 @@ class ClaimView(viewsets.ModelViewSet):
                             "claim_id": claim.id,
                             "risk_score": results[0].get("score"),
                             "model_snapshot_id": results[0].get("model_snapshot_id"),
+                            "rule_flags": results[0].get("rule_flags", []),
                         },
                     )
 
@@ -1118,6 +1144,54 @@ def login_view(request):
                 "role": profile.role,
             },
         }
+    )
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def signup_view(request):
+    password = request.data.get("password")
+    confirm_password = request.data.get("confirm_password")
+
+    if not password or len(str(password)) < 8:
+        return Response(
+            {"detail": "Password must be at least 8 characters long."},
+            status=drf_status.HTTP_400_BAD_REQUEST,
+        )
+
+    if password != confirm_password:
+        return Response(
+            {"detail": "Password confirmation does not match."},
+            status=drf_status.HTTP_400_BAD_REQUEST,
+        )
+
+    payload = request.data.copy()
+    payload.setdefault("status", Status.ACTIVE)
+    serializer = EmployeeSerializer(data=payload)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        employee, user, _temp_password = _create_employee_with_user(serializer, password=str(password))
+    except serializers.ValidationError as exc:
+        raise exc
+
+    token, _ = Token.objects.get_or_create(user=user)
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+
+    return Response(
+        {
+            "token": token.key,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "role": profile.role,
+            },
+            "employee": EmployeeSerializer(employee).data,
+        },
+        status=drf_status.HTTP_201_CREATED,
     )
 
 
