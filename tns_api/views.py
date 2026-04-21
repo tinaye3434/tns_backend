@@ -23,7 +23,7 @@ from rest_framework import status as drf_status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework import serializers
-from rest_framework.permissions import AllowAny, IsAuthenticated, BasePermission
+from rest_framework.permissions import AllowAny
 from rest_framework.authtoken.models import Token
 from .serializers import (
     AllowanceSerializer,
@@ -63,6 +63,13 @@ from . import fraud
 from .ocr import run_ocr
 
 logger = logging.getLogger(__name__)
+
+
+def _request_actor(request):
+    user = getattr(request, "user", None)
+    if user and getattr(user, "is_authenticated", False):
+        return user
+    return None
 
 
 def _create_employee_with_user(
@@ -607,19 +614,7 @@ class ClaimView(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='decision')
     def decision(self, request, pk=None):
         claim = self.get_object()
-        user = request.user
-        if not user or not user.is_authenticated:
-            return Response(
-                {"detail": "Authentication required."},
-                status=drf_status.HTTP_401_UNAUTHORIZED,
-            )
-
-        profile, _ = UserProfile.objects.get_or_create(user=user)
-        if profile.role not in {UserRole.APPROVER, UserRole.ADMIN, UserRole.SUPERUSER}:
-            return Response(
-                {"detail": "You do not have permission to action claims."},
-                status=drf_status.HTTP_403_FORBIDDEN,
-            )
+        actor = _request_actor(request)
 
         if claim.approval_status != ApprovalStatus.PENDING:
             return Response(
@@ -670,7 +665,7 @@ class ClaimView(viewsets.ModelViewSet):
             audit_action = "claim_rejected"
 
         AuditLog.objects.create(
-            actor=user,
+            actor=actor,
             action=audit_action,
             target_user=None,
             metadata={
@@ -1097,19 +1092,6 @@ class LocationView(viewsets.ReadOnlyModelViewSet):
     queryset = Location.objects.all().order_by('name')
 
 
-class IsAdminRole(BasePermission):
-    def has_permission(self, request, view):
-        user = request.user
-        if not user or not user.is_authenticated:
-            return False
-        if user.is_superuser:
-            return True
-        profile = getattr(user, "profile", None)
-        if not profile:
-            profile = UserProfile.objects.create(user=user)
-        return profile.role in {UserRole.ADMIN, UserRole.SUPERUSER}
-
-
 @api_view(['POST'])
 # @permission_classes([AllowAny])
 def login_view(request):
@@ -1198,19 +1180,35 @@ def signup_view(request):
 @api_view(['POST'])
 # @permission_classes([IsAuthenticated])
 def logout_view(request):
-    Token.objects.filter(user=request.user).delete()
+    actor = _request_actor(request)
+    if actor:
+        Token.objects.filter(user=actor).delete()
     return Response({"detail": "Logged out."})
 
 
 @api_view(['GET'])
 # @permission_classes([IsAuthenticated])
 def me_view(request):
-    serializer = UserSerializer(request.user)
+    actor = _request_actor(request)
+    if not actor:
+        return Response(
+            {
+                "id": None,
+                "username": "",
+                "email": "",
+                "first_name": "",
+                "last_name": "",
+                "is_active": False,
+                "role": UserRole.EMPLOYEE,
+            }
+        )
+
+    serializer = UserSerializer(actor)
     return Response(serializer.data)
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated, IsAdminRole])
+@permission_classes([AllowAny])
 def users_view(request):
     users = User.objects.all().order_by('username')
     serializer = UserSerializer(users, many=True)
@@ -1218,7 +1216,7 @@ def users_view(request):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated, IsAdminRole])
+@permission_classes([AllowAny])
 def user_role_update_view(request, user_id):
     try:
         target_user = User.objects.get(id=user_id)
@@ -1242,7 +1240,7 @@ def user_role_update_view(request, user_id):
         profile.role = role
         profile.save(update_fields=["role"])
         AuditLog.objects.create(
-            actor=request.user,
+            actor=_request_actor(request),
             action="role_updated",
             target_user=target_user,
             metadata={
@@ -1256,7 +1254,7 @@ def user_role_update_view(request, user_id):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated, IsAdminRole])
+@permission_classes([AllowAny])
 def password_reset_view(request):
     user_id = request.data.get('user_id')
     username = request.data.get('username')
@@ -1281,7 +1279,7 @@ def password_reset_view(request):
     user.save(update_fields=["password"])
 
     AuditLog.objects.create(
-        actor=request.user,
+        actor=_request_actor(request),
         action="password_reset",
         target_user=user,
         metadata={"method": "temporary_password"},
