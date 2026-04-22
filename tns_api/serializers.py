@@ -94,6 +94,7 @@ class ClaimsSerializer(serializers.ModelSerializer):
             'auto_distance',
         )
         extra_kwargs = {
+            'employee_id': {'required': False},
             'approval_status': {'required': False},
             'user_distance': {'required': False},
             'calculated_distance': {'required': False},
