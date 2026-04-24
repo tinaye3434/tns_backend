@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from .models import (
     Allowance,
+    AllowanceNature,
     ApprovalStage,
     Employee,
     Claim,
@@ -9,6 +10,7 @@ from .models import (
     Location,
     Status,
     ApprovalStatus,
+    GradeRange,
     UserProfile,
     UserRole,
     Receipt,
@@ -41,10 +43,35 @@ class StatusDefaultMixin:
 
 
 class AllowanceSerializer(StatusDefaultMixin, serializers.ModelSerializer):
+    nature = serializers.ChoiceField(
+        choices=AllowanceNature.choices,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+    )
+    grade_range = serializers.ChoiceField(
+        choices=GradeRange.choices,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+    )
+
+    def validate_nature(self, value):
+        if value in ("", None):
+            return None
+        return value
+
+    def validate_grade_range(self, value):
+        if value in ("", None):
+            return None
+        return value
+
     class Meta:
         model = Allowance
-        fields = ('id', 'title', 'cost', 'status')
+        fields = ('id', 'title', 'nature', 'grade_range', 'cost', 'status')
         extra_kwargs = {
+            'nature': {'required': False},
+            'grade_range': {'required': False},
             'status': {'required': False},
         }
         
@@ -231,6 +258,13 @@ class UserSerializer(serializers.ModelSerializer):
 class EmployeeSerializer(StatusDefaultMixin, serializers.ModelSerializer):
     user_id = serializers.IntegerField(read_only=True)
     user = UserSerializer(read_only=True)
+    grade_range = serializers.SerializerMethodField()
+
+    def get_grade_range(self, obj):
+        try:
+            return GradeRange.from_grade(obj.grade)
+        except (TypeError, ValueError):
+            return None
 
     class Meta:
         model = Employee
@@ -245,6 +279,7 @@ class EmployeeSerializer(StatusDefaultMixin, serializers.ModelSerializer):
             'department',
             'position',
             'grade',
+            'grade_range',
             'gender',
             'status',
         )

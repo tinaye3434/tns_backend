@@ -47,6 +47,8 @@ from .models import (
     Department,
     Position,
     Grade,
+    GradeRange,
+    AllowanceNature,
     Gender,
     TnsClassifications,
     Status,
@@ -1019,6 +1021,8 @@ def enums_view(request):
             "department": _choice_list(Department),
             "position": _choice_list(Position),
             "grade": _choice_list(Grade),
+            "grade_range": _choice_list(GradeRange),
+            "allowance_nature": _choice_list(AllowanceNature),
             "gender": _choice_list(Gender),
             "tns_classification": _choice_list(TnsClassifications),
             "status": _choice_list(Status),
@@ -1087,7 +1091,7 @@ def openai_health_view(request):
         )
 
 
-class LocationView(viewsets.ReadOnlyModelViewSet):
+class LocationView(viewsets.ModelViewSet):
     serializer_class = LocationSerializer
     queryset = Location.objects.all().order_by('name')
 

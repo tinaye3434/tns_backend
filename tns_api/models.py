@@ -18,6 +18,40 @@ class Grade(models.IntegerChoices):
     ONE = 1, "One"
     TWO = 2, "Two"
     THREE = 3, "Three"
+    FOUR = 4, "Four"
+    FIVE = 5, "Five"
+    SIX = 6, "Six"
+    SEVEN = 7, "Seven"
+    EIGHT = 8, "Eight"
+    NINE = 9, "Nine"
+    TEN = 10, "Ten"
+    ELEVEN = 11, "Eleven"
+    TWELVE = 12, "Twelve"
+
+
+class GradeRange(models.TextChoices):
+    LOWER = "LOWER", "Lower"
+    MIDDLE = "MIDDLE", "Middle"
+    UPPER = "UPPER", "Upper"
+
+    @classmethod
+    def from_grade(cls, grade):
+        grade_value = int(grade)
+        if 1 <= grade_value <= 4:
+            return cls.LOWER
+        if 5 <= grade_value <= 8:
+            return cls.MIDDLE
+        if 9 <= grade_value <= 12:
+            return cls.UPPER
+        raise ValueError("Grade must be between 1 and 12.")
+
+
+class AllowanceNature(models.TextChoices):
+    OUT_OF_STATION = "OUT_OF_STATION", "Out of Station"
+    FUEL = "FUEL", "Fuel"
+    BREAKFAST = "BREAKFAST", "Breakfast"
+    LUNCH = "LUNCH", "Lunch"
+    DINNER = "DINNER", "Dinner"
     
 class Gender(models.TextChoices):
     MALE = "M", "Male"
@@ -91,6 +125,18 @@ class Employee(models.Model):
     
 class Allowance(models.Model):
     title = models.CharField(max_length=50)
+    nature = models.CharField(
+        max_length=20,
+        choices=AllowanceNature.choices,
+        null=True,
+        blank=True,
+    )
+    grade_range = models.CharField(
+        max_length=10,
+        choices=GradeRange.choices,
+        null=True,
+        blank=True,
+    )
     cost = models.FloatField()
     status = models.CharField(
         max_length=1,
