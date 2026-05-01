@@ -26,24 +26,26 @@ class Grade(models.IntegerChoices):
     NINE = 9, "Nine"
     TEN = 10, "Ten"
     ELEVEN = 11, "Eleven"
-    TWELVE = 12, "Twelve"
 
 
 class GradeRange(models.TextChoices):
-    LOWER = "LOWER", "Lower"
-    MIDDLE = "MIDDLE", "Middle"
-    UPPER = "UPPER", "Upper"
+    GENERAL = "GENERAL", "General"
+    MANAGEMENT = "MANAGEMENT", "Management"
+    HODS_AND_COUNCILORS = "HODS_AND_COUNCILORS", "HODs and Other Councilors"
+    CEO_AND_COUNCIL_CHAIR = "CEO_AND_COUNCIL_CHAIR", "CEO and Council Chair"
 
     @classmethod
     def from_grade(cls, grade):
         grade_value = int(grade)
-        if 1 <= grade_value <= 4:
-            return cls.LOWER
-        if 5 <= grade_value <= 8:
-            return cls.MIDDLE
-        if 9 <= grade_value <= 12:
-            return cls.UPPER
-        raise ValueError("Grade must be between 1 and 12.")
+        if 1 <= grade_value <= 8:
+            return cls.GENERAL
+        if grade_value == 9:
+            return cls.MANAGEMENT
+        if grade_value == 10:
+            return cls.HODS_AND_COUNCILORS
+        if grade_value == 11:
+            return cls.CEO_AND_COUNCIL_CHAIR
+        raise ValueError("Grade must be between 1 and 11.")
 
 
 class AllowanceNature(models.TextChoices):
@@ -132,7 +134,7 @@ class Allowance(models.Model):
         blank=True,
     )
     grade_range = models.CharField(
-        max_length=10,
+        max_length=32,
         choices=GradeRange.choices,
         null=True,
         blank=True,

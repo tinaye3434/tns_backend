@@ -1,4 +1,5 @@
 from django.db import transaction, close_old_connections
+from django.db.models import Q
 import threading
 import logging
 import os
@@ -65,6 +66,12 @@ from . import fraud
 from .ocr import run_ocr
 
 logger = logging.getLogger(__name__)
+DEFAULT_ERRANDS_FACTOR = 1.2
+RECEIPT_REQUIRED_ALLOWANCE_NATURES = {
+    AllowanceNature.FUEL,
+    AllowanceNature.OUT_OF_STATION,
+}
+OSRM_DRIVING_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving"
 
 
 def _request_actor(request):
@@ -72,6 +79,127 @@ def _request_actor(request):
     if user and getattr(user, "is_authenticated", False):
         return user
     return None
+
+
+def _resolve_employee_for_user(user):
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+
+    employee = Employee.objects.filter(user=user).first()
+    if employee:
+        return employee
+
+    identifiers = []
+    seen = set()
+    for raw_value in (getattr(user, "email", ""), getattr(user, "username", "")):
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        normalized = value.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        identifiers.append(value)
+
+    if not identifiers:
+        return None
+
+    query = Q()
+    for identifier in identifiers:
+        query |= Q(email__iexact=identifier)
+
+    candidates = list(Employee.objects.filter(query, user__isnull=True).order_by("id"))
+    if len(candidates) != 1:
+        return None
+
+    employee = candidates[0]
+    employee.user = user
+    employee.save(update_fields=["user"])
+    return employee
+
+
+def _receipt_required_allowance_ids():
+    return list(
+        Allowance.objects.filter(nature__in=RECEIPT_REQUIRED_ALLOWANCE_NATURES).values_list("id", flat=True)
+    )
+
+
+def _receipt_required_claim_lines_qs(claim):
+    allowance_ids = _receipt_required_allowance_ids()
+    if not allowance_ids:
+        return ClaimLine.objects.none()
+    return ClaimLine.objects.filter(claim_id=claim.id, allowance_id__in=allowance_ids)
+
+
+def _receipt_required_claim_line_ids(claim):
+    return list(_receipt_required_claim_lines_qs(claim).values_list("id", flat=True))
+
+
+def _receipt_required_receipts_qs(claim):
+    line_ids = _receipt_required_claim_line_ids(claim)
+    if not line_ids:
+        return Receipt.objects.none()
+    return Receipt.objects.filter(claim_line_id__in=line_ids)
+
+
+def _missing_receipt_required_claim_line_ids(claim):
+    line_ids = _receipt_required_claim_line_ids(claim)
+    if not line_ids:
+        return []
+
+    line_ids_with_receipts = set(
+        Receipt.objects.filter(claim_line_id__in=line_ids).values_list("claim_line_id", flat=True)
+    )
+    return [line_id for line_id in line_ids if line_id not in line_ids_with_receipts]
+
+
+def _claim_line_requires_receipts(claim_line):
+    return Allowance.objects.filter(
+        id=claim_line.allowance_id,
+        nature__in=RECEIPT_REQUIRED_ALLOWANCE_NATURES,
+    ).exists()
+
+
+def _fetch_osrm_driving_route(origin_coords, destination_coords):
+    origin_lat, origin_lon = origin_coords
+    destination_lat, destination_lon = destination_coords
+    coordinates = f"{origin_lon},{origin_lat};{destination_lon},{destination_lat}"
+    url = (
+        f"{OSRM_DRIVING_ROUTE_URL}/{coordinates}?"
+        f"{urlencode({'alternatives': 'false', 'geometries': 'geojson', 'overview': 'full', 'steps': 'false'})}"
+    )
+    req = urlrequest.Request(
+        url,
+        headers={
+            "User-Agent": "tns-backend/1.0 (routing proxy)",
+        },
+    )
+
+    with urlrequest.urlopen(req, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    route = (payload.get("routes") or [{}])[0]
+    geometry = route.get("geometry") or {}
+    raw_coordinates = geometry.get("coordinates") or []
+
+    points = []
+    for point in raw_coordinates:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        longitude, latitude = point[0], point[1]
+        try:
+            points.append([float(latitude), float(longitude)])
+        except (TypeError, ValueError):
+            continue
+
+    if payload.get("code") != "Ok" or len(points) < 2:
+        raise ValueError("Driving route unavailable.")
+
+    return {
+        "distance_km": float(route.get("distance") or 0.0) / 1000.0,
+        "duration_minutes": float(route.get("duration") or 0.0) / 60.0,
+        "coordinates": points,
+    }
 
 
 def _create_employee_with_user(
@@ -355,13 +483,13 @@ class ClaimView(viewsets.ModelViewSet):
             destination_coords = self._geocode_location(destination_name)
             if not origin_coords or not destination_coords:
                 return None
-            return self._haversine_km(origin_coords, destination_coords)
+            return self._haversine_km(origin_coords, destination_coords) * 2
 
         # Haversine formula
         return self._haversine_km(
             (origin.latitude, origin.longitude),
             (destination.latitude, destination.longitude),
-        )
+        ) * 2
 
     def _haversine_km(self, origin_coords, destination_coords):
         radius_km = 6371.0
@@ -423,6 +551,10 @@ class ClaimView(viewsets.ModelViewSet):
         if validation:
             system_distance = validation.adjusted_distance_km
         if system_distance is None:
+            calculated_distance = getattr(claim, "calculated_distance", None)
+            if calculated_distance:
+                system_distance = calculated_distance * DEFAULT_ERRANDS_FACTOR
+        if system_distance is None:
             system_distance = claim.user_distance
 
         if not system_distance:
@@ -469,7 +601,7 @@ class ClaimView(viewsets.ModelViewSet):
         if serializer.validated_data.get('employee_id') is None:
             authenticated_user = getattr(request, "user", None)
             if authenticated_user and authenticated_user.is_authenticated:
-                employee = Employee.objects.filter(user=authenticated_user).first()
+                employee = _resolve_employee_for_user(authenticated_user)
                 if employee:
                     serializer.validated_data['employee_id'] = employee.id
 
@@ -526,11 +658,11 @@ class ClaimView(viewsets.ModelViewSet):
                 {"calculated_distance": "Unable to calculate distance for the given locations."}
             )
 
-        errands_factor = 1.2
+        errands_factor = DEFAULT_ERRANDS_FACTOR
         adjusted_distance = calculated_distance * errands_factor
 
         serializer.validated_data['calculated_distance'] = calculated_distance
-        serializer.validated_data['user_distance'] = adjusted_distance
+        serializer.validated_data['user_distance'] = 0.0
 
         with transaction.atomic():
             claim = Claim.objects.create(**serializer.validated_data)
@@ -601,9 +733,17 @@ class ClaimView(viewsets.ModelViewSet):
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
+
+        claimed_distance = serializer.validated_data.get('user_distance')
+        actual_mileage = serializer.validated_data.get('actual_mileage')
+        if claimed_distance is None and actual_mileage is not None:
+            serializer.validated_data['user_distance'] = actual_mileage
+            claimed_distance = actual_mileage
+        if actual_mileage is None and claimed_distance is not None:
+            serializer.validated_data['actual_mileage'] = claimed_distance
+
         claim = serializer.save()
 
-        claimed_distance = serializer.validated_data.get('actual_mileage')
         if claimed_distance is not None:
             self._update_gps_validation(claim, claimed_distance)
 
@@ -691,12 +831,38 @@ class ClaimView(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='submit-documents')
     def submit_documents(self, request, pk=None):
         claim = self.get_object()
-        receipts_qs = Receipt.objects.filter(claim_line__claim_id=claim.id)
+        entered_distance = claim.actual_mileage if claim.actual_mileage is not None else claim.user_distance
+        if entered_distance is None or float(entered_distance) <= 0:
+            return Response(
+                {"detail": "Enter the user distance before submitting receipts."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        required_line_ids = _receipt_required_claim_line_ids(claim)
+        if not required_line_ids:
+            if not claim.documents_submitted:
+                claim.documents_submitted = True
+                claim.save(update_fields=["documents_submitted"])
+            return Response(
+                {"detail": "No receipts are required for this claim."},
+                status=drf_status.HTTP_200_OK,
+            )
+
+        missing_line_ids = _missing_receipt_required_claim_line_ids(claim)
+        if missing_line_ids:
+            return Response(
+                {
+                    "detail": (
+                        "Submit receipts for all fuel and out of station allowances "
+                        "before completing this step."
+                    )
+                },
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        receipts_qs = _receipt_required_receipts_qs(claim)
         pending_ids = list(
-            Receipt.objects.filter(
-                claim_line__claim_id=claim.id,
-                ocr_result__isnull=True,
-            ).values_list("id", flat=True)
+            receipts_qs.filter(ocr_result__isnull=True).values_list("id", flat=True)
         )
 
         started = _queue_receipt_processing(pending_ids)
@@ -710,18 +876,28 @@ class ClaimView(viewsets.ModelViewSet):
             )
 
         return Response(
-            {"detail": "Document processing started in the background."},
+            {"detail": "Receipt processing started in the background."},
             status=drf_status.HTTP_202_ACCEPTED,
         )
 
     @action(detail=True, methods=['post'], url_path='reprocess-ocr')
     def reprocess_ocr(self, request, pk=None):
         claim = self.get_object()
-        receipts_qs = Receipt.objects.filter(claim_line__claim_id=claim.id)
+        required_line_ids = _receipt_required_claim_line_ids(claim)
+        if not required_line_ids:
+            if not claim.documents_submitted:
+                claim.documents_submitted = True
+                claim.save(update_fields=["documents_submitted"])
+            return Response(
+                {"detail": "No receipts are required for this claim."},
+                status=drf_status.HTTP_200_OK,
+            )
+
+        receipts_qs = _receipt_required_receipts_qs(claim)
         receipt_ids = list(receipts_qs.values_list("id", flat=True))
 
         started = _queue_receipt_processing(receipt_ids, force=True)
-        if receipts_qs.exists() and not claim.documents_submitted:
+        if not _missing_receipt_required_claim_line_ids(claim) and receipts_qs.exists() and not claim.documents_submitted:
             claim.documents_submitted = True
             claim.save(update_fields=["documents_submitted"])
         if not started:
@@ -738,7 +914,7 @@ class ClaimView(viewsets.ModelViewSet):
     def documents_summary(self, request, pk=None):
         claim = self.get_object()
         receipts = (
-            Receipt.objects.filter(claim_line__claim_id=claim.id)
+            _receipt_required_receipts_qs(claim)
             .select_related("ocr_result", "claim_line")
         )
 
@@ -816,6 +992,16 @@ class ClaimLineView(viewsets.ModelViewSet):
             receipts = Receipt.objects.filter(claim_line=claim_line)
             serializer = ReceiptSerializer(receipts, many=True)
             return Response(serializer.data)
+
+        if not _claim_line_requires_receipts(claim_line):
+            return Response(
+                {
+                    "detail": (
+                        "Receipts can only be uploaded for fuel and out of station allowances."
+                    )
+                },
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
 
         files = request.FILES.getlist('files')
         if not files:
@@ -1089,6 +1275,65 @@ def openai_health_view(request):
             },
             status=drf_status.HTTP_200_OK,
         )
+
+
+@api_view(['GET'])
+def driving_route_view(request):
+    try:
+        origin_lat = float(request.query_params.get("origin_lat"))
+        origin_lng = float(request.query_params.get("origin_lng"))
+        destination_lat = float(request.query_params.get("destination_lat"))
+        destination_lng = float(request.query_params.get("destination_lng"))
+    except (TypeError, ValueError):
+        return Response(
+            {
+                "detail": (
+                    "origin_lat, origin_lng, destination_lat, and destination_lng are required numeric query parameters."
+                )
+            },
+            status=drf_status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        route = _fetch_osrm_driving_route(
+            (origin_lat, origin_lng),
+            (destination_lat, destination_lng),
+        )
+    except ValueError as error:
+        return Response(
+            {"detail": str(error)},
+            status=drf_status.HTTP_404_NOT_FOUND,
+        )
+    except HTTPError as error:
+        return Response(
+            {"detail": f"Routing service returned HTTP {error.code}."},
+            status=drf_status.HTTP_502_BAD_GATEWAY,
+        )
+    except (socket.timeout, TimeoutError):
+        return Response(
+            {"detail": "Routing service timed out."},
+            status=drf_status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+    except ssl.SSLError as error:
+        return Response(
+            {"detail": f"Routing service SSL error: {error}"},
+            status=drf_status.HTTP_502_BAD_GATEWAY,
+        )
+    except URLError as error:
+        reason = error.reason
+        reason_text = str(reason) if reason else "Unknown routing network error."
+        return Response(
+            {"detail": reason_text},
+            status=drf_status.HTTP_502_BAD_GATEWAY,
+        )
+    except Exception:
+        logger.exception("Driving route lookup failed.")
+        return Response(
+            {"detail": "Unable to load the driving route right now."},
+            status=drf_status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response(route, status=drf_status.HTTP_200_OK)
 
 
 class LocationView(viewsets.ModelViewSet):

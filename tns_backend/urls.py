@@ -37,6 +37,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include(router.urls)),
     path('api/openai-health/', views.openai_health_view, name='openai-health'),
+    path('api/routes/driving/', views.driving_route_view, name='driving-route'),
     path('api/enums/', views.enums_view, name='enums'),
     path('api/auth/login/', views.login_view, name='login'),
     path('api/auth/signup/', views.signup_view, name='signup'),
